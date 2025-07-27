@@ -58,6 +58,7 @@ cp .env.example .env
 | `WUSDC_PROCESS_ID` | wUSDC token process ID | `7zH9dlMNoxprab9loshv3Y7WG45DOny_Vrq9KrXObdQ` |
 | `MIN_BALANCE` | Minimum ARIO balance | `400000` |
 | `TARGET_BALANCE` | Target ARIO balance | `400000` |
+| `MAX_SLIPPAGE` | Maximum allowed slippage % | `20` |
 | `CRON_SCHEDULE` | Cron schedule pattern | `0 */6 * * *` (every 6 hours) |
 | `DRY_RUN` | Enable dry run mode | `false` |
 | `SLACK_TOKEN` | Slack bot token | Optional |
@@ -69,6 +70,14 @@ cp .env.example .env
 - Example: `400000` = 400,000 ARIO tokens
 - The bot will trigger when balance < `MIN_BALANCE`
 - It will swap enough wUSDC to bring balance to `TARGET_BALANCE`
+
+### Slippage Protection
+
+- The bot calculates expected slippage before executing swaps
+- If slippage exceeds `MAX_SLIPPAGE`, the swap is aborted
+- Default maximum slippage is 20%
+- This protects against executing swaps during high volatility or low liquidity
+- Aborted swaps are notified via Slack and will retry on next schedule
 
 ## Usage
 

@@ -36,6 +36,7 @@ const config = {
   wusdcProcessId: process.env.WUSDC_PROCESS_ID || '7zH9dlMNoxprab9loshv3Y7WG45DOny_Vrq9KrXObdQ',
   minBalance: parseFloat(process.env.MIN_BALANCE || '400000'),
   targetBalance: parseFloat(process.env.TARGET_BALANCE || '400000'),
+  maxSlippage: parseFloat(process.env.MAX_SLIPPAGE || '20'),
   cronSchedule: process.env.CRON_SCHEDULE || '0 */6 * * *',
   dryRun: process.env.DRY_RUN === 'true'
 };
@@ -235,6 +236,15 @@ async function transferToTargetWallet(amountArio, isRecovery = false) {
       };
     }
     
+    // Safety check: verify we have sufficient balance before attempting transfer
+    const currentBalances = await getWalletBalances();
+    if (currentBalances.arioBalance < amountArio) {
+      logger.error(`❌ Insufficient ARIO balance for transfer`);
+      logger.error(`├─ Available: ${currentBalances.arioBalance.toFixed(2)} ARIO`);
+      logger.error(`└─ Requested: ${amountArio.toFixed(2)} ARIO`);
+      throw new Error(`Insufficient ARIO balance. Available: ${currentBalances.arioBalance.toFixed(2)}, Requested: ${amountArio.toFixed(2)}`);
+    }
+    
     logger.info(`Transferring ${amountArio.toFixed(2)} ARIO to target wallet: ${config.targetWalletAddress}${isRecovery ? ' (recovery from previous run)' : ''}`);
     
     const transferMessage = await message({
@@ -313,6 +323,30 @@ async function performTopUp() {
         logger.info(`├─ wUSDC required: ${swapDetails.usdcRequired.toFixed(2)} wUSDC (${swapDetails.usdcRequiredRaw.toLocaleString()} smallest unit)`);
         logger.info(`├─ Expected ARIO output: ${swapDetails.expectedArio.toFixed(2)} ARIO`);
         logger.info(`└─ Expected slippage: ${swapDetails.slippage.toFixed(3)}%`);
+        
+        // Check if slippage exceeds maximum allowed
+        if (swapDetails.slippage > config.maxSlippage) {
+          logger.error(`❌ SLIPPAGE TOO HIGH - ABORTING SWAP`);
+          logger.error(`├─ Current slippage: ${swapDetails.slippage.toFixed(3)}%`);
+          logger.error(`├─ Maximum allowed: ${config.maxSlippage}%`);
+          logger.error(`└─ Price impact too severe, waiting for better market conditions`);
+          
+          // Send notification about high slippage
+          await sendSlackMessage(
+            `⚠️ *ARIO Top-up Aborted - High Slippage*\n\n` +
+            `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
+            `*Current Balance:* ${currentBalance.toLocaleString()} ARIO\n` +
+            `*Needs:* ${amountNeeded.toLocaleString()} ARIO\n\n` +
+            `*Slippage Protection:*\n` +
+            `• Expected slippage: ${swapDetails.slippage.toFixed(3)}%\n` +
+            `• Maximum allowed: ${config.maxSlippage}%\n` +
+            `• Status: Swap aborted to prevent excessive loss\n\n` +
+            `The bot will retry at the next scheduled interval.`
+          );
+          
+          logger.info('================== TOP-UP ABORTED DUE TO HIGH SLIPPAGE ==================');
+          return;
+        }
       } else {
         logger.info(`└─ No swap required - bot wallet has sufficient ARIO`);
       }
@@ -362,9 +396,29 @@ async function performTopUp() {
           logger.info('⏳ Waiting for swap to fully settle (60 seconds)...');
           await new Promise(resolve => setTimeout(resolve, 60000));
           
+          // Check bot wallet balance after swap to get actual amount received
+          const postSwapBalances = await getWalletBalances();
+          const arioReceivedFromSwap = postSwapBalances.arioBalance;
+          
+          logger.info(`📊 Bot wallet ARIO balance after swap: ${postSwapBalances.arioBalance.toFixed(2)} ARIO`);
+          logger.info(`📈 Expected from swap: ${swapDetails.expectedArio.toFixed(2)} ARIO`);
+          
+          // Safety check: only transfer what we actually have
+          const amountToTransfer = Math.min(
+            arioReceivedFromSwap,
+            swapDetails.actualSwapNeeded  // Don't transfer more than what was needed
+          );
+          
+          if (amountToTransfer <= 0) {
+            logger.error('❌ No ARIO available to transfer after swap');
+            throw new Error('Swap failed - no ARIO available to transfer');
+          }
+          
+          logger.info(`✅ Transferring ${amountToTransfer.toFixed(2)} ARIO to target wallet (available: ${arioReceivedFromSwap.toFixed(2)} ARIO)`);
+          
           // Transfer swapped ARIO to target wallet
           logger.info('💸 Transferring newly swapped ARIO to target wallet...');
-          const transferResult = await transferToTargetWallet(swapDetails.expectedArio);
+          const transferResult = await transferToTargetWallet(amountToTransfer);
           
           // Check new balance of target wallet
           logger.info('📊 Checking new target wallet ARIO balance...');
