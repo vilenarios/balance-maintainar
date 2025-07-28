@@ -70,14 +70,7 @@ export class PermaswapDEX {
       
       // Check if pool info has the expected structure
       if (!poolInfo.PX || !poolInfo.PY) {
-        this.logger.warn('Pool info missing PX/PY, using mock data for testing');
-        return {
-          price: '0.0177', // 1 ARIO = 0.0177 wUSDC
-          reserveX: '25922987718', // wUSDC
-          reserveY: '1465945229537', // ARIO
-          formattedReserveX: '25922.987718',
-          formattedReserveY: '1465945.229537'
-        };
+        throw new Error('Pool info missing required fields PX/PY');
       }
       
       // PX is wUSDC (X), PY is ARIO (Y)
@@ -105,15 +98,7 @@ export class PermaswapDEX {
       };
     } catch (error) {
       this.logger.error('Failed to get price:', error);
-      // Return mock data for testing
-      this.logger.warn('Using mock price data for testing');
-      return {
-        price: '0.0177', // 1 ARIO = 0.0177 wUSDC
-        reserveX: '25922987718',
-        reserveY: '1465945229537',
-        formattedReserveX: '25922.987718',
-        formattedReserveY: '1465945.229537'
-      };
+      throw error;
     }
   }
 
