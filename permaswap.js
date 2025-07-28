@@ -4,7 +4,7 @@ import BN from 'bignumber.js';
 const defaultAOConfig = {
   CU_URL: 'https://cu.ao-testnet.xyz',
   MU_URL: 'https://mu.ao-testnet.xyz',
-  GATEWAY_URL: 'https://g8way.io:443'
+  GATEWAY_URL: 'https://arweave.net:443'
 };
 
 const waitSeconds = async (seconds) => {
