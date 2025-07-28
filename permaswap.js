@@ -205,7 +205,7 @@ export class PermaswapDEX {
       
       // Wait for settlement
       this.logger.info('⏳ Waiting for settlement to process...');
-      await waitSeconds(20);
+      await waitSeconds(30);
       
       // Step 3: Get settle result (optional - swap already executed)
       this.logger.info(`Checking settle result for transfer: ${transferMessageId}`);
