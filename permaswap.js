@@ -120,7 +120,8 @@ export class PermaswapDEX {
       this.logger.info(`Order requested with messageId: ${messageId}`);
       
       // Wait for the order to be processed
-      await waitSeconds(3);
+      this.logger.info('⏳ Waiting for order to be processed (30 seconds)...');
+      await waitSeconds(30);
       
       // Get the note details
       const res = await this.ao.dryrun({
