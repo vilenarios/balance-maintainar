@@ -5,7 +5,7 @@ import winston from 'winston';
 import dotenv from 'dotenv';
 import { readFileSync } from 'fs';
 import { PermaswapDEX } from './permaswap.js';
-import { sendSwapNotification } from './slack.js';
+import { sendSwapNotification, sendMessageToSlack } from './slack.js';
 
 dotenv.config();
 
@@ -37,6 +37,7 @@ const config = {
   minBalance: parseFloat(process.env.MIN_BALANCE || '400000'),
   targetBalance: parseFloat(process.env.TARGET_BALANCE || '400000'),
   maxSlippage: parseFloat(process.env.MAX_SLIPPAGE || '20'),
+  minTransferAmount: parseFloat(process.env.MIN_TRANSFER_AMOUNT || '500'),
   cronSchedule: process.env.CRON_SCHEDULE || '0 */6 * * *',
   dryRun: process.env.DRY_RUN === 'true'
 };
@@ -299,6 +300,14 @@ async function performTopUp() {
       logger.info(`Target balance: ${config.targetBalance.toLocaleString()} ARIO`);
       logger.info(`Need to acquire: ${amountNeeded.toLocaleString()} ARIO`);
       
+      // Check if amount needed is below minimum transfer threshold
+      if (amountNeeded < config.minTransferAmount) {
+        logger.info(`⚠️  Amount needed (${amountNeeded.toFixed(2)} ARIO) is below minimum transfer threshold (${config.minTransferAmount} ARIO)`);
+        logger.info('Skipping top-up - will check again at next scheduled interval');
+        logger.info('================== TOP-UP SKIPPED - AMOUNT TOO SMALL ==================');
+        return;
+      }
+      
       // Get wallet balances
       logger.info('💰 Checking wallet balances...');
       const walletBalances = await getWalletBalances();
@@ -332,7 +341,7 @@ async function performTopUp() {
           logger.error(`└─ Price impact too severe, waiting for better market conditions`);
           
           // Send notification about high slippage
-          await sendSlackMessage(
+          await sendMessageToSlack(
             `⚠️ *ARIO Top-up Aborted - High Slippage*\n\n` +
             `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
             `*Current Balance:* ${currentBalance.toLocaleString()} ARIO\n` +
@@ -420,6 +429,10 @@ async function performTopUp() {
           logger.info('💸 Transferring newly swapped ARIO to target wallet...');
           const transferResult = await transferToTargetWallet(amountToTransfer);
           
+          // Wait for blockchain state to update
+          logger.info('⏳ Waiting for blockchain state to update (30 seconds)...');
+          await new Promise(resolve => setTimeout(resolve, 30000));
+          
           // Check new balance of target wallet
           logger.info('📊 Checking new target wallet ARIO balance...');
           const newBalance = await checkArioBalance();
@@ -478,6 +491,10 @@ async function performTopUp() {
           }, true);
         } else {
           logger.info('✅ Top-up completed using only existing ARIO from bot wallet');
+          
+          // Wait for blockchain state to update
+          logger.info('⏳ Waiting for blockchain state to update (30 seconds)...');
+          await new Promise(resolve => setTimeout(resolve, 30000));
           
           // Check new balance
           const newBalance = await checkArioBalance();

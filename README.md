@@ -59,6 +59,7 @@ cp .env.example .env
 | `MIN_BALANCE` | Minimum ARIO balance | `400000` |
 | `TARGET_BALANCE` | Target ARIO balance | `400000` |
 | `MAX_SLIPPAGE` | Maximum allowed slippage % | `20` |
+| `MIN_TRANSFER_AMOUNT` | Minimum ARIO to transfer | `500` |
 | `CRON_SCHEDULE` | Cron schedule pattern | `0 */6 * * *` (every 6 hours) |
 | `DRY_RUN` | Enable dry run mode | `false` |
 | `SLACK_TOKEN` | Slack bot token | Optional |
@@ -70,6 +71,7 @@ cp .env.example .env
 - Example: `400000` = 400,000 ARIO tokens
 - The bot will trigger when balance < `MIN_BALANCE`
 - It will swap enough wUSDC to bring balance to `TARGET_BALANCE`
+- If the amount needed is less than `MIN_TRANSFER_AMOUNT`, the bot will skip and wait
 
 ### Slippage Protection
 
