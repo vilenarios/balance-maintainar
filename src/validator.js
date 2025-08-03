@@ -50,19 +50,21 @@ export function validateConfig(config, logger) {
     errors.push('MAX_SLIPPAGE must be between 0 and 100');
   }
   
-  // Validate cron schedule
-  const cronPattern = /^(\*|([0-9]|[1-5][0-9])) (\*|([0-9]|1[0-9]|2[0-3])) (\*|([1-9]|[1-2][0-9]|3[0-1])) (\*|([1-9]|1[0-2])) (\*|[0-6])$/;
-  if (!cronPattern.test(config.cronSchedule)) {
-    errors.push('CRON_SCHEDULE must be a valid cron expression');
+  // Validate cron schedule - node-cron uses standard cron format
+  // We'll use a simpler validation that just checks the field count
+  const cronFields = config.cronSchedule.trim().split(/\s+/);
+  if (cronFields.length < 5 || cronFields.length > 6) {
+    errors.push('CRON_SCHEDULE must be a valid cron expression (5 or 6 fields)');
   }
   
-  // Validate Slack config if enabled
+  // Validate Slack config if enabled (either explicitly or auto-detected)
   if (config.notifications.slack.enabled) {
     if (!config.notifications.slack.token || config.notifications.slack.token === 'xoxb-your-slack-bot-token-here') {
-      errors.push('SLACK_TOKEN must be configured when SLACK_ENABLED is true');
+      errors.push('SLACK_TOKEN must be configured when Slack is enabled');
     }
-    if (!config.notifications.slack.channel) {
-      errors.push('SLACK_CHANNEL must be configured when SLACK_ENABLED is true');
+    // Only validate channel if token is configured
+    if (config.notifications.slack.token && config.notifications.slack.token !== 'xoxb-your-slack-bot-token-here' && !config.notifications.slack.channel) {
+      errors.push('SLACK_CHANNEL must be configured when Slack is enabled');
     }
   }
   
