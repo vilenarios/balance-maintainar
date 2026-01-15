@@ -1,11 +1,16 @@
-import { connect, message, result, dryrun, createDataItemSigner } from '@permaweb/aoconnect';
+import { connect, message, result, createDataItemSigner } from '@permaweb/aoconnect';
 import Arweave from 'arweave';
+import { ethers } from 'ethers';
 import cron from 'node-cron';
 import winston from 'winston';
 import dotenv from 'dotenv';
 import { readFileSync } from 'fs';
-import { PermaswapDEX } from './permaswap.js';
-import { sendSwapNotification, sendMessageToSlack } from './slack.js';
+import { BaseBridge } from './src/baseBridge.js';
+import { KyberSwapDEX } from './src/kyberswap.js';
+import { sendSwapNotification, sendMessageToSlack } from './src/slack.js';
+import { validateConfig, validateWallet } from './src/validator.js';
+import { CSVTransactionLogger } from './src/csvLogger.js';
+import { verifyBridgeCredit, waitForBridgeCredit } from './src/bridgeVerifier.js';
 
 dotenv.config();
 
@@ -21,528 +26,689 @@ const logger = winston.createLogger({
   ]
 });
 
+// Initialize Arweave for wallet operations
 const arweave = Arweave.init({
   host: 'arweave.net',
   port: 443,
   protocol: 'https'
 });
 
+// Configure AO connection for ARIO token (using ardrive CU for better compatibility)
+const aoArdrive = connect({
+  CU_URL: 'https://cu.ardrive.io',
+  MU_URL: 'https://mu.ao-testnet.xyz',
+  GATEWAY_URL: 'https://arweave.net:443'
+});
+
+const { dryrun: dryrunArdrive } = aoArdrive;
+
+// Configuration
 const config = {
+  // Arweave wallet for AO operations
   walletPath: process.env.WALLET_PATH || './wallet.json',
-  turboWalletAddress: process.env.TURBO_WALLET_ADDRESS,
-  targetWalletAddress: process.env.TARGET_WALLET_ADDRESS || 'ZeRVUPflKvdOP1Ow_AMYmTggZr33Ofbe_Ud8_alpRIU',
-  arioProcessId: process.env.ARIO_PROCESS_ID || 'qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE',
-  permaswapPoolId: process.env.PERMASWAP_POOL_ID || 'V7yzKBtzmY_MacDF-czrb1RY06xfidcGVrOjnhthMWM',
-  wusdcProcessId: process.env.WUSDC_PROCESS_ID || '7zH9dlMNoxprab9loshv3Y7WG45DOny_Vrq9KrXObdQ',
+  targetWalletAddress: process.env.TARGET_WALLET_ADDRESS,
+
+  // ARIO token on AO
+  targetToken: {
+    processId: process.env.TARGET_TOKEN_PROCESS_ID || 'qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE',
+    symbol: process.env.TARGET_TOKEN_SYMBOL || 'ARIO',
+    decimals: parseInt(process.env.TARGET_TOKEN_DECIMALS || '6')
+  },
+
+  // Base chain configuration
+  base: {
+    rpcUrl: process.env.BASE_RPC_URL || 'https://mainnet.base.org',
+    privateKey: process.env.BASE_PRIVATE_KEY,
+    arioContract: process.env.ARIO_BASE_CONTRACT || '0x138746adfA52909E5920def027f5a8dc1C7EfFb6',
+    usdcContract: process.env.USDC_BASE_CONTRACT || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    minEthBalance: parseFloat(process.env.MIN_ETH_BALANCE || '0.001'),
+  },
+
+  // Balance and trading configuration
   minBalance: parseFloat(process.env.MIN_BALANCE || '400000'),
   targetBalance: parseFloat(process.env.TARGET_BALANCE || '400000'),
   maxSlippage: parseFloat(process.env.MAX_SLIPPAGE || '20'),
   minTransferAmount: parseFloat(process.env.MIN_TRANSFER_AMOUNT || '500'),
   cronSchedule: process.env.CRON_SCHEDULE || '0 */6 * * *',
-  dryRun: process.env.DRY_RUN === 'true'
+  dryRun: process.env.DRY_RUN === 'true',
+
+  // Notification configuration
+  notifications: {
+    slack: {
+      enabled: process.env.SLACK_ENABLED === 'true' || (process.env.SLACK_TOKEN && process.env.SLACK_TOKEN !== 'xoxb-your-slack-bot-token-here'),
+      token: process.env.SLACK_TOKEN,
+      channel: process.env.SLACK_CHANNEL
+    }
+  }
 };
 
-let wallet;
-let permaswap;
+// Global instances
+let arweaveWallet;
+let baseBridge;
+let kyberSwap;
+let csvLogger;
 
-async function loadWallet() {
+/**
+ * Load and initialize all wallets and services
+ */
+async function initialize() {
   try {
+    // Load Arweave wallet for AO operations
     const walletData = readFileSync(config.walletPath, 'utf-8');
-    wallet = JSON.parse(walletData);
-    logger.info('Wallet loaded successfully');
-    
-    // Initialize Permaswap DEX
-    const signer = createDataItemSigner(wallet);
-    permaswap = new PermaswapDEX(config.permaswapPoolId, signer, logger, config.arioProcessId, config.wusdcProcessId);
-    
+    arweaveWallet = JSON.parse(walletData);
+
+    if (!validateWallet(arweaveWallet, logger)) {
+      throw new Error('Invalid Arweave wallet format');
+    }
+
+    logger.info('Arweave wallet loaded successfully');
+
+    // Initialize Base chain components (shared provider/wallet for efficiency)
+    const baseProvider = new ethers.JsonRpcProvider(config.base.rpcUrl);
+    const baseWallet = new ethers.Wallet(config.base.privateKey, baseProvider);
+
+    baseBridge = new BaseBridge(config.base, logger, baseProvider, baseWallet);
+    kyberSwap = new KyberSwapDEX(baseProvider, baseWallet, logger, config.base);
+
+    logger.info(`Base wallet initialized: ${baseWallet.address}`);
+
+    // Initialize CSV logger
+    csvLogger = new CSVTransactionLogger('transactions.csv');
+    logger.info('CSV transaction logger initialized');
+
   } catch (error) {
-    logger.error('Failed to load wallet:', error);
+    logger.error('Failed to initialize:', error);
     throw error;
   }
 }
 
-async function checkArioBalance() {
+/**
+ * Check ARIO balance on target AO wallet
+ */
+async function checkTargetArioBalance() {
   try {
-    const balanceResult = await dryrun({
-      process: config.arioProcessId,
+    const balanceResult = await dryrunArdrive({
+      process: config.targetToken.processId,
       tags: [
         { name: 'Action', value: 'Balance' },
         { name: 'Target', value: config.targetWalletAddress }
       ]
     });
-    
-    // Balance is returned in mARIO (6 decimals), convert to ARIO
-    const balanceInMario = parseFloat(balanceResult.Messages[0]?.Data || '0');
-    const balanceInArio = balanceInMario / 1_000_000;
-    logger.info(`ARIO balance for ${config.targetWalletAddress}: ${balanceInArio} ARIO (${balanceInMario} mARIO)`);
-    return balanceInArio;
+
+    const balanceInSmallestUnit = parseFloat(balanceResult.Messages?.[0]?.Data || '0');
+    const divisor = Math.pow(10, config.targetToken.decimals);
+    const balanceInTokens = balanceInSmallestUnit / divisor;
+
+    logger.info(`Target wallet ARIO balance: ${balanceInTokens.toLocaleString()} ARIO`);
+    return balanceInTokens;
   } catch (error) {
-    logger.error('Failed to check ARIO balance:', error);
+    logger.error('Failed to check target ARIO balance:', error);
     throw error;
   }
 }
 
-async function getWalletBalances() {
+/**
+ * Check ARIO balance in bot's AO wallet
+ */
+async function checkBotAoArioBalance() {
   try {
-    const walletAddress = await arweave.wallets.jwkToAddress(wallet);
-    
-    // Check AR balance
-    const arBalance = await arweave.wallets.getBalance(walletAddress);
-    const arBalanceInAr = parseFloat(arweave.ar.winstonToAr(arBalance));
-    
-    // Check wUSDC balance
-    const wusdcResult = await dryrun({
-      process: config.wusdcProcessId,
+    const walletAddress = await arweave.wallets.jwkToAddress(arweaveWallet);
+
+    const balanceResult = await dryrunArdrive({
+      process: config.targetToken.processId,
       tags: [
         { name: 'Action', value: 'Balance' },
         { name: 'Target', value: walletAddress }
       ]
     });
-    
-    const wusdcBalanceRaw = parseFloat(wusdcResult.Messages[0]?.Data || '0');
-    const wusdcBalance = wusdcBalanceRaw / 1_000_000; // Convert from smallest unit
-    
-    // Check ARIO balance
-    const arioResult = await dryrun({
-      process: config.arioProcessId,
-      tags: [
-        { name: 'Action', value: 'Balance' },
-        { name: 'Target', value: walletAddress }
-      ]
-    });
-    
-    const arioBalanceRaw = parseFloat(arioResult.Messages[0]?.Data || '0');
-    const arioBalance = arioBalanceRaw / 1_000_000; // Convert from mARIO to ARIO
-    
-    logger.info(`Wallet ${walletAddress} balances:`, {
-      AR: arBalanceInAr,
-      wUSDC: wusdcBalance,
-      ARIO: arioBalance
-    });
-    
+
+    const balanceInSmallestUnit = parseFloat(balanceResult.Messages?.[0]?.Data || '0');
+    const divisor = Math.pow(10, config.targetToken.decimals);
+    const balanceInTokens = balanceInSmallestUnit / divisor;
+
+    logger.info(`Bot AO wallet ARIO balance: ${balanceInTokens.toLocaleString()} ARIO`);
     return {
       address: walletAddress,
-      arBalance: arBalanceInAr,
-      wusdcBalance,
-      wusdcBalanceRaw,
-      arioBalance,
-      arioBalanceRaw
+      balance: balanceInTokens,
+      balanceRaw: balanceInSmallestUnit
     };
   } catch (error) {
-    logger.error('Failed to get wallet balances:', error);
+    logger.error('Failed to check bot AO ARIO balance:', error);
     throw error;
   }
 }
 
-async function calculateSwapDetails(amountNeeded, botWalletArio = 0) {
+/**
+ * Transfer ARIO from bot's AO wallet to target wallet
+ */
+async function transferArioOnAO(amount, isRecovery = false) {
   try {
-    // Calculate actual swap amount needed after considering bot wallet balance
-    const actualSwapNeeded = Math.max(0, amountNeeded - botWalletArio);
-    
-    if (actualSwapNeeded === 0) {
-      logger.info('Bot wallet has sufficient ARIO balance, no swap needed');
-      return {
-        amountNeeded,
-        actualSwapNeeded: 0,
-        botWalletContribution: amountNeeded,
-        usdcRequired: 0,
-        usdcRequiredRaw: 0,
-        expectedArio: 0,
-        expectedArioRaw: 0,
-        slippage: 0,
-        currentPrice: 0,
-        swapRequired: false
-      };
-    }
-    
-    // Get current price from Permaswap
-    const priceInfo = await permaswap.getPrice();
-    
-    // Price is wUSDC per ARIO
-    const usdcPerArio = parseFloat(priceInfo.price);
-    const usdcNeeded = actualSwapNeeded * usdcPerArio;
-    
-    // Calculate expected output using Permaswap's GetAmountOut
-    const swapResult = await permaswap.calculateSwapOutput(
-      config.wusdcProcessId,  // TokenIn: wUSDC
-      Math.ceil(usdcNeeded * 1_000_000) // AmountIn: convert to smallest unit (6 decimals)
-    );
-    
-    const expectedArio = parseFloat(swapResult.amountOut) / 1_000_000;
-    const slippage = ((actualSwapNeeded - expectedArio) / actualSwapNeeded) * 100;
-    
-    return {
-      amountNeeded,
-      actualSwapNeeded,
-      botWalletContribution: botWalletArio,
-      usdcRequired: usdcNeeded,
-      usdcRequiredRaw: Math.ceil(usdcNeeded * 1_000_000),
-      expectedArio,
-      expectedArioRaw: swapResult.amountOut,
-      slippage,
-      currentPrice: usdcPerArio,
-      priceInfo,
-      swapRequired: true
-    };
-  } catch (error) {
-    logger.error('Failed to calculate swap details:', error);
-    throw error;
-  }
-}
+    const walletAddress = await arweave.wallets.jwkToAddress(arweaveWallet);
 
-async function swapOnPermaswap(amountToSwap, swapDetails) {
-  try {
-    logger.info(`Initiating swap for ${amountToSwap} ARIO tokens on Permaswap`);
-    
     if (config.dryRun) {
-      logger.info('[DRY RUN] Swap details:', {
-        arioNeeded: swapDetails.actualSwapNeeded || swapDetails.amountNeeded,
-        usdcRequired: swapDetails.usdcRequired.toFixed(2),
-        expectedArio: swapDetails.expectedArio.toFixed(2),
-        slippage: swapDetails.slippage.toFixed(2) + '%',
-        currentPrice: `1 ARIO = ${swapDetails.currentPrice.toFixed(6)} wUSDC`
-      });
+      logger.info(`[DRY RUN] Would transfer ${amount.toFixed(2)} ARIO to ${config.targetWalletAddress}`);
+      return { success: true, dryRun: true, amount };
     }
-    
-    // Execute the swap (dry run or real)
-    const result = await permaswap.executeSwap(
-      config.wusdcProcessId,  // tokenIn: wUSDC
-      swapDetails.usdcRequiredRaw,  // amountIn in smallest unit
-      config.arioProcessId,  // tokenOut: ARIO
-      config.dryRun
-    );
-    
-    if (config.dryRun) {
-      const expectedArioReceived = parseFloat(result.expectedOut) / 1_000_000;
-      logger.info(`[DRY RUN] Would receive approximately ${expectedArioReceived.toFixed(2)} ARIO`);
-    }
-    
-    return result;
-    
-  } catch (error) {
-    logger.error('Failed to swap on Permaswap:', error);
-    throw error;
-  }
-}
 
-async function transferToTargetWallet(amountArio, isRecovery = false) {
-  try {
-    if (config.dryRun) {
-      logger.info(`[DRY RUN] Would transfer ${amountArio.toFixed(2)} ARIO to target wallet: ${config.targetWalletAddress}${isRecovery ? ' (recovery from previous run)' : ''}`);
-      return {
-        success: true,
-        dryRun: true,
-        amount: amountArio,
-        isRecovery
-      };
+    // Verify balance before transfer
+    const botBalance = await checkBotAoArioBalance();
+    if (botBalance.balance < amount) {
+      throw new Error(`Insufficient ARIO balance. Have: ${botBalance.balance.toFixed(2)}, Need: ${amount.toFixed(2)}`);
     }
-    
-    // Safety check: verify we have sufficient balance before attempting transfer
-    const currentBalances = await getWalletBalances();
-    if (currentBalances.arioBalance < amountArio) {
-      logger.error(`❌ Insufficient ARIO balance for transfer`);
-      logger.error(`├─ Available: ${currentBalances.arioBalance.toFixed(2)} ARIO`);
-      logger.error(`└─ Requested: ${amountArio.toFixed(2)} ARIO`);
-      throw new Error(`Insufficient ARIO balance. Available: ${currentBalances.arioBalance.toFixed(2)}, Requested: ${amountArio.toFixed(2)}`);
-    }
-    
-    logger.info(`Transferring ${amountArio.toFixed(2)} ARIO to target wallet: ${config.targetWalletAddress}${isRecovery ? ' (recovery from previous run)' : ''}`);
-    
+
+    logger.info(`Transferring ${amount.toFixed(2)} ARIO to target wallet...`);
+
     const transferMessage = await message({
-      process: config.arioProcessId,
-      signer: createDataItemSigner(wallet),
+      process: config.targetToken.processId,
+      signer: createDataItemSigner(arweaveWallet),
       tags: [
         { name: 'Action', value: 'Transfer' },
         { name: 'Recipient', value: config.targetWalletAddress },
-        { name: 'Quantity', value: Math.floor(amountArio * 1_000_000).toString() } // Convert to mARIO
+        { name: 'Quantity', value: Math.floor(amount * Math.pow(10, config.targetToken.decimals)).toString() }
       ]
     });
-    
+
     const transferResult = await result({
       message: transferMessage,
-      process: config.arioProcessId
+      process: config.targetToken.processId
     });
-    
-    logger.info('Transfer completed:', transferResult);
+
+    logger.info(`Transfer completed: ${transferMessage}`);
+
+    // Log to CSV
+    if (csvLogger) {
+      if (isRecovery) {
+        await csvLogger.logRecovery({
+          token: 'ARIO',
+          amount,
+          fromWallet: walletAddress,
+          toWallet: config.targetWalletAddress,
+          txId: transferMessage
+        });
+      } else {
+        await csvLogger.logTransfer({
+          token: 'ARIO',
+          amount,
+          fromWallet: walletAddress,
+          toWallet: config.targetWalletAddress,
+          txId: transferMessage,
+          notes: 'Post-bridge transfer to target wallet'
+        });
+      }
+    }
+
     return {
-      ...transferResult,
+      success: true,
       messageId: transferMessage,
+      amount,
       isRecovery
     };
   } catch (error) {
-    logger.error('Failed to transfer to target wallet:', error);
+    logger.error('Failed to transfer ARIO on AO:', error);
     throw error;
   }
 }
 
+/**
+ * Main top-up flow
+ */
 async function performTopUp() {
   try {
-    logger.info('================== ARIO TOP-UP BOT STARTING ==================');
+    logger.info('═══════════════════════════════════════════════════════════════');
+    logger.info('                    ARIO TOP-UP BOT - CROSS-CHAIN              ');
+    logger.info('═══════════════════════════════════════════════════════════════');
     logger.info(`Configuration:`, {
       minBalance: `${config.minBalance.toLocaleString()} ARIO`,
       targetBalance: `${config.targetBalance.toLocaleString()} ARIO`,
       targetWallet: config.targetWalletAddress,
       dryRun: config.dryRun
     });
-    
+
     if (config.dryRun) {
       logger.info('🔍 [DRY RUN MODE] - No actual transactions will be executed');
     }
-    
-    // Check current ARIO balance
-    logger.info('📊 Checking ARIO balance...');
-    const currentBalance = await checkArioBalance();
-    
-    if (currentBalance < config.minBalance) {
-      const amountNeeded = config.targetBalance - currentBalance;
-      logger.info('⚠️  Balance below minimum threshold');
-      logger.info(`Current balance: ${currentBalance.toLocaleString()} ARIO`);
-      logger.info(`Target balance: ${config.targetBalance.toLocaleString()} ARIO`);
-      logger.info(`Need to acquire: ${amountNeeded.toLocaleString()} ARIO`);
-      
-      // Check if amount needed is below minimum transfer threshold
-      if (amountNeeded < config.minTransferAmount) {
-        logger.info(`⚠️  Amount needed (${amountNeeded.toFixed(2)} ARIO) is below minimum transfer threshold (${config.minTransferAmount} ARIO)`);
-        logger.info('Skipping top-up - will check again at next scheduled interval');
-        logger.info('================== TOP-UP SKIPPED - AMOUNT TOO SMALL ==================');
-        return;
-      }
-      
-      // Get wallet balances
-      logger.info('💰 Checking wallet balances...');
-      const walletBalances = await getWalletBalances();
-      
-      // Check if bot wallet has any ARIO balance from previous runs
-      if (walletBalances.arioBalance > 0) {
-        logger.info(`📦 Bot wallet has ${walletBalances.arioBalance.toLocaleString()} ARIO from previous run`);
-      }
-      
-      // Calculate and show swap details
-      logger.info('🧮 Calculating swap details...');
-      const swapDetails = await calculateSwapDetails(amountNeeded, walletBalances.arioBalance);
-      
-      logger.info('💱 SWAP CALCULATION SUMMARY:');
-      logger.info(`├─ Total ARIO needed: ${swapDetails.amountNeeded.toLocaleString()} ARIO`);
-      if (walletBalances.arioBalance > 0) {
-        logger.info(`├─ Bot wallet can provide: ${walletBalances.arioBalance.toLocaleString()} ARIO`);
-        logger.info(`├─ Need to swap for: ${swapDetails.actualSwapNeeded.toLocaleString()} ARIO`);
-      }
-      if (swapDetails.swapRequired) {
-        logger.info(`├─ Current price: 1 ARIO = ${swapDetails.currentPrice.toFixed(6)} wUSDC`);
-        logger.info(`├─ wUSDC required: ${swapDetails.usdcRequired.toFixed(2)} wUSDC (${swapDetails.usdcRequiredRaw.toLocaleString()} smallest unit)`);
-        logger.info(`├─ Expected ARIO output: ${swapDetails.expectedArio.toFixed(2)} ARIO`);
-        logger.info(`└─ Expected slippage: ${swapDetails.slippage.toFixed(3)}%`);
-        
-        // Check if slippage exceeds maximum allowed
-        if (swapDetails.slippage > config.maxSlippage) {
-          logger.error(`❌ SLIPPAGE TOO HIGH - ABORTING SWAP`);
-          logger.error(`├─ Current slippage: ${swapDetails.slippage.toFixed(3)}%`);
-          logger.error(`├─ Maximum allowed: ${config.maxSlippage}%`);
-          logger.error(`└─ Price impact too severe, waiting for better market conditions`);
-          
-          // Send notification about high slippage
-          await sendMessageToSlack(
-            `⚠️ *ARIO Top-up Aborted - High Slippage*\n\n` +
-            `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
-            `*Current Balance:* ${currentBalance.toLocaleString()} ARIO\n` +
-            `*Needs:* ${amountNeeded.toLocaleString()} ARIO\n\n` +
-            `*Slippage Protection:*\n` +
-            `• Expected slippage: ${swapDetails.slippage.toFixed(3)}%\n` +
-            `• Maximum allowed: ${config.maxSlippage}%\n` +
-            `• Status: Swap aborted to prevent excessive loss\n\n` +
-            `The bot will retry at the next scheduled interval.`
-          );
-          
-          logger.info('================== TOP-UP ABORTED DUE TO HIGH SLIPPAGE ==================');
-          return;
-        }
-      } else {
-        logger.info(`└─ No swap required - bot wallet has sufficient ARIO`);
-      }
-      
-      // Step 1: Transfer any existing ARIO from bot wallet first
-      let recoveryTransferResult = null;
-      if (walletBalances.arioBalance > 0) {
-        const transferAmount = Math.min(walletBalances.arioBalance, amountNeeded);
-        logger.info(`🔄 Transferring existing ${transferAmount.toLocaleString()} ARIO from bot wallet...`);
-        
-        try {
-          recoveryTransferResult = await transferToTargetWallet(transferAmount, true);
-          logger.info(`✅ Successfully transferred ${transferAmount.toLocaleString()} ARIO from previous run`);
-        } catch (error) {
-          logger.error('❌ Failed to transfer existing ARIO from bot wallet:', error);
-          logger.error('Bot will continue with swap process to acquire additional ARIO');
-        }
-      }
-      
-      // Step 2: Check if we still need to swap
-      if (swapDetails.swapRequired) {
-        // Check if we have enough wUSDC
-        if (walletBalances.wusdcBalance < swapDetails.usdcRequired) {
-          const shortfall = swapDetails.usdcRequired - walletBalances.wusdcBalance;
-          logger.error('❌ INSUFFICIENT FUNDS');
-          logger.error(`├─ Have: ${walletBalances.wusdcBalance.toFixed(2)} wUSDC`);
-          logger.error(`├─ Need: ${swapDetails.usdcRequired.toFixed(2)} wUSDC`);
-          logger.error(`└─ Shortfall: ${shortfall.toFixed(2)} wUSDC`);
-          
-          if (config.dryRun) {
-            logger.info('[DRY RUN] Would need to acquire more wUSDC before swapping');
-          }
-          return;
-        }
-        
-        logger.info('✅ Sufficient wUSDC balance confirmed');
-        logger.info(`├─ Available: ${walletBalances.wusdcBalance.toFixed(2)} wUSDC`);
-        logger.info(`├─ Required: ${swapDetails.usdcRequired.toFixed(2)} wUSDC`);
-        logger.info(`└─ Remaining after swap: ${(walletBalances.wusdcBalance - swapDetails.usdcRequired).toFixed(2)} wUSDC`);
-        
-        // Execute swap
-        logger.info('🔄 Executing swap on Permaswap...');
-        const swapResult = await swapOnPermaswap(swapDetails.actualSwapNeeded, swapDetails);
-        
-        if (!config.dryRun) {
-          // Wait for swap to fully settle
-          logger.info('⏳ Waiting for swap to fully settle (60 seconds)...');
-          await new Promise(resolve => setTimeout(resolve, 60000));
-          
-          // Check bot wallet balance after swap to get actual amount received
-          const postSwapBalances = await getWalletBalances();
-          const arioReceivedFromSwap = postSwapBalances.arioBalance;
-          
-          logger.info(`📊 Bot wallet ARIO balance after swap: ${postSwapBalances.arioBalance.toFixed(2)} ARIO`);
-          logger.info(`📈 Expected from swap: ${swapDetails.expectedArio.toFixed(2)} ARIO`);
-          
-          // Safety check: only transfer what we actually have
-          const amountToTransfer = Math.min(
-            arioReceivedFromSwap,
-            swapDetails.actualSwapNeeded  // Don't transfer more than what was needed
-          );
-          
-          if (amountToTransfer <= 0) {
-            logger.error('❌ No ARIO available to transfer after swap');
-            throw new Error('Swap failed - no ARIO available to transfer');
-          }
-          
-          logger.info(`✅ Transferring ${amountToTransfer.toFixed(2)} ARIO to target wallet (available: ${arioReceivedFromSwap.toFixed(2)} ARIO)`);
-          
-          // Transfer swapped ARIO to target wallet
-          logger.info('💸 Transferring newly swapped ARIO to target wallet...');
-          const transferResult = await transferToTargetWallet(amountToTransfer);
-          
-          // Wait for blockchain state to update
-          logger.info('⏳ Waiting for blockchain state to update (30 seconds)...');
-          await new Promise(resolve => setTimeout(resolve, 30000));
-          
-          // Check new balance of target wallet
-          logger.info('📊 Checking new target wallet ARIO balance...');
-          const newBalance = await checkArioBalance();
-          logger.info(`New target wallet balance: ${newBalance.toLocaleString()} ARIO`);
-          
-          // Get updated balances
-          const updatedWalletBalances = await getWalletBalances();
-          
-          // Send Slack notification for successful swap
-          await sendSwapNotification({
-            ...swapDetails,
-            targetBalance: config.targetBalance,
-            targetWallet: config.targetWalletAddress,
-            previousArioBalance: currentBalance,
-            previousWusdcBalance: walletBalances.wusdcBalance,
-            newBalance,
-            wusdcBalanceAfter: updatedWalletBalances.wusdcBalance,
-            botWalletArioUsed: walletBalances.arioBalance,
-            transactionIds: {
-              recoveryTransferId: recoveryTransferResult?.messageId || null,
-              orderMessageId: swapResult.orderMessageId,
-              noteId: swapResult.noteId,
-              transferToSettleId: swapResult.transferMessageId,
-              transferToTargetId: transferResult.messageId
-            }
-          });
-        } else {
-          // Show what would happen in dry run
-          logger.info(`[DRY RUN] Would transfer ${swapDetails.expectedArio.toFixed(2)} ARIO to target wallet`);
-          
-          // Send Slack notification for dry run
-          await sendSwapNotification({
-            ...swapDetails,
-            targetBalance: config.targetBalance,
-            targetWallet: config.targetWalletAddress,
-            previousArioBalance: currentBalance,
-            previousWusdcBalance: walletBalances.wusdcBalance,
-            wusdcBalanceAfter: walletBalances.wusdcBalance - swapDetails.usdcRequired,
-            botWalletArioUsed: walletBalances.arioBalance
-          }, true);
-        }
-      } else {
-        // No swap needed, just used existing ARIO
-        if (config.dryRun) {
-          logger.info('[DRY RUN] Would complete top-up using only existing ARIO from bot wallet');
-          
-          // Send dry run notification for recovery-only transfer
-          await sendSwapNotification({
-            ...swapDetails,
-            targetBalance: config.targetBalance,
-            targetWallet: config.targetWalletAddress,
-            previousArioBalance: currentBalance,
-            previousWusdcBalance: walletBalances.wusdcBalance,
-            wusdcBalanceAfter: walletBalances.wusdcBalance,
-            botWalletArioUsed: walletBalances.arioBalance
-          }, true);
-        } else {
-          logger.info('✅ Top-up completed using only existing ARIO from bot wallet');
-          
-          // Wait for blockchain state to update
-          logger.info('⏳ Waiting for blockchain state to update (30 seconds)...');
-          await new Promise(resolve => setTimeout(resolve, 30000));
-          
-          // Check new balance
-          const newBalance = await checkArioBalance();
-          logger.info(`New target wallet balance: ${newBalance.toLocaleString()} ARIO`);
-          
-          // Send notification for recovery-only transfer
-          await sendSwapNotification({
-            ...swapDetails,
-            targetBalance: config.targetBalance,
-            targetWallet: config.targetWalletAddress,
-            previousArioBalance: currentBalance,
-            previousWusdcBalance: walletBalances.wusdcBalance,
-            newBalance,
-            wusdcBalanceAfter: walletBalances.wusdcBalance,
-            botWalletArioUsed: walletBalances.arioBalance,
-            transactionIds: {
-              recoveryTransferId: recoveryTransferResult?.messageId || null
-            }
-          });
-        }
-      }
-      
-      logger.info('✅ Top-up completed successfully');
-    } else {
+
+    // Step 1: Check target wallet ARIO balance on AO
+    logger.info('📊 Step 1: Checking target wallet ARIO balance on AO...');
+    const currentBalance = await checkTargetArioBalance();
+
+    if (currentBalance >= config.minBalance) {
       logger.info(`✅ Balance sufficient: ${currentBalance.toLocaleString()} ARIO`);
+      logger.info('═══════════════════════════════════════════════════════════════');
+      return;
     }
-    
-    logger.info('================== TOP-UP CHECK COMPLETE ==================');
+
+    const amountNeeded = config.targetBalance - currentBalance;
+    logger.info('⚠️  Balance below minimum threshold');
+    logger.info(`├─ Current: ${currentBalance.toLocaleString()} ARIO`);
+    logger.info(`├─ Target: ${config.targetBalance.toLocaleString()} ARIO`);
+    logger.info(`└─ Need: ${amountNeeded.toLocaleString()} ARIO`);
+
+    // Check minimum transfer threshold
+    if (amountNeeded < config.minTransferAmount) {
+      logger.info(`⚠️  Amount needed (${amountNeeded.toFixed(2)} ARIO) below minimum (${config.minTransferAmount} ARIO)`);
+      logger.info('Skipping - will check again at next interval');
+      return;
+    }
+
+    // Step 2: Check bot's AO wallet for existing ARIO (recovery)
+    logger.info('📊 Step 2: Checking bot AO wallet for existing ARIO...');
+    const botAoBalance = await checkBotAoArioBalance();
+
+    let remainingNeeded = amountNeeded;
+    let recoveryTransferResult = null;
+
+    if (botAoBalance.balance > 0) {
+      const transferAmount = Math.min(botAoBalance.balance, amountNeeded);
+      logger.info(`📦 Found ${botAoBalance.balance.toFixed(2)} ARIO in bot AO wallet`);
+      logger.info(`🔄 Transferring ${transferAmount.toFixed(2)} ARIO to target (recovery)...`);
+
+      try {
+        recoveryTransferResult = await transferArioOnAO(transferAmount, true);
+        remainingNeeded -= transferAmount;
+        logger.info(`✅ Recovery transfer complete. Still need: ${remainingNeeded.toFixed(2)} ARIO`);
+      } catch (error) {
+        logger.error('Recovery transfer failed, continuing with swap:', error);
+      }
+    }
+
+    if (remainingNeeded <= 0) {
+      logger.info('✅ Top-up complete using existing ARIO');
+      logger.info('═══════════════════════════════════════════════════════════════');
+      return;
+    }
+
+    // Step 3: Check Base wallet balances
+    logger.info('📊 Step 3: Checking Base chain wallet balances...');
+    const baseBalances = await baseBridge.getAllBalances();
+
+    logger.info(`Base wallet: ${baseBalances.address}`);
+    logger.info(`├─ ETH: ${baseBalances.eth.balanceFormatted.toFixed(6)} ETH`);
+    logger.info(`├─ USDC: ${baseBalances.usdc.balanceFormatted.toFixed(2)} USDC`);
+    logger.info(`└─ ARIO: ${baseBalances.ario.balanceFormatted.toFixed(2)} ARIO`);
+
+    // Check ETH for gas
+    if (baseBalances.eth.balanceFormatted < config.base.minEthBalance) {
+      logger.warn(`⚠️  LOW ETH BALANCE - Gas may be insufficient`);
+      logger.warn(`├─ Current: ${baseBalances.eth.balanceFormatted.toFixed(6)} ETH`);
+      logger.warn(`└─ Minimum: ${config.base.minEthBalance} ETH`);
+
+      await sendMessageToSlack(
+        `⚠️ *Low ETH Balance Warning*\n\n` +
+        `Base wallet ETH balance is low:\n` +
+        `• Current: ${baseBalances.eth.balanceFormatted.toFixed(6)} ETH\n` +
+        `• Minimum: ${config.base.minEthBalance} ETH\n\n` +
+        `Please fund the Base wallet to ensure transactions can complete.`
+      );
+    }
+
+    // Step 3.5: Check for existing ARIO on Base (recovery from failed burn)
+    if (baseBalances.ario.balanceFormatted > 0) {
+      logger.info(`📦 Found ${baseBalances.ario.balanceFormatted.toFixed(2)} ARIO on Base (from previous swap/failed burn)`);
+      // Burn directly to target wallet (Turbo wallet)
+      const aoDestinationForRecovery = config.targetWalletAddress;
+
+      if (config.dryRun) {
+        logger.info(`[DRY RUN] Would burn ${baseBalances.ario.balanceFormatted.toFixed(2)} ARIO to Turbo wallet: ${aoDestinationForRecovery}`);
+      } else {
+        try {
+          logger.info(`🔥 Burning existing ARIO on Base to recover...`);
+          const recoveryBurnResult = await baseBridge.burnToAO(
+            baseBalances.ario.balanceFormatted,
+            aoDestinationForRecovery,
+            false
+          );
+
+          if (csvLogger) {
+            await csvLogger.logBaseBurn({
+              token: 'ARIO',
+              amount: baseBalances.ario.balanceFormatted,
+              baseWallet: baseBridge.getWalletAddress(),
+              aoDestination: aoDestinationForRecovery,
+              txHash: recoveryBurnResult.txHash,
+              gasUsed: recoveryBurnResult.gasUsed,
+              notes: 'Recovery burn from previous failed burn'
+            });
+          }
+
+          logger.info(`✅ Recovery burn complete: ${recoveryBurnResult.txHash}`);
+
+          // Verify bridge credit arrived on AO
+          logger.info('⏳ Waiting for bridge Credit-Notice on AO...');
+          const verifyResult = await waitForBridgeCredit(
+            config.targetWalletAddress,
+            baseBalances.ario.balanceFormatted,
+            {
+              maxWaitMs: 30 * 60 * 1000, // Wait up to 30 minutes
+              pollIntervalMs: 60 * 1000, // Poll every 1 minute
+              onPoll: ({ attempt, elapsedMs }) => {
+                logger.info(`├─ Checking for Credit-Notice (attempt ${attempt}, ${Math.round(elapsedMs/1000)}s elapsed)...`);
+              }
+            }
+          );
+
+          if (verifyResult.success) {
+            logger.info(`✅ Bridge verified! Credit-Notice received on AO`);
+            logger.info(`├─ TX: ${verifyResult.transaction.id}`);
+            logger.info(`├─ Amount: ${verifyResult.transaction.quantityArio.toFixed(2)} ARIO`);
+            logger.info(`└─ Wait time: ${Math.round(verifyResult.waitTimeMs/1000)}s`);
+          } else {
+            logger.warn(`⚠️ Could not verify bridge Credit-Notice within timeout`);
+            logger.warn(`└─ The bridge may still be processing. Check manually.`);
+          }
+
+          // Update remaining needed (ARIO will arrive on AO via bridge)
+          remainingNeeded = Math.max(0, remainingNeeded - baseBalances.ario.balanceFormatted);
+          logger.info(`└─ Updated remaining needed: ${remainingNeeded.toFixed(2)} ARIO`);
+
+          if (remainingNeeded <= 0) {
+            logger.info('✅ Recovery burn fulfilled the needed amount');
+
+            if (verifyResult.success) {
+              // Success - bridge verified
+              await sendMessageToSlack(
+                `✅ *ARIO Recovery Burn Complete*\n\n` +
+                `Found and burned ${baseBalances.ario.balanceFormatted.toFixed(2)} ARIO from Base wallet.\n\n` +
+                `*Burn TX:* \`${recoveryBurnResult.txHash}\`\n` +
+                `*Destination:* Turbo wallet\n` +
+                `*Bridge Credit:* \`${verifyResult.transaction.id}\`\n` +
+                `*Amount Received:* ${verifyResult.transaction.quantityArio.toFixed(2)} ARIO ✅`
+              );
+            } else {
+              // Alert - bridge not verified within timeout
+              await sendMessageToSlack(
+                `⚠️ *ALERT: ARIO Burn Succeeded But Bridge Unverified*\n\n` +
+                `The burn transaction completed on Base, but we could not verify the Credit-Notice on AO within 30 minutes.\n\n` +
+                `*Burn TX:* \`${recoveryBurnResult.txHash}\`\n` +
+                `*Amount Burned:* ${baseBalances.ario.balanceFormatted.toFixed(2)} ARIO\n` +
+                `*Destination:* \`${config.targetWalletAddress}\`\n\n` +
+                `⚠️ Please verify manually that the ARIO arrived on AO.`
+              );
+            }
+            logger.info('═══════════════════════════════════════════════════════════════');
+            return;
+          }
+        } catch (recoveryBurnError) {
+          logger.error('Failed to burn existing ARIO on Base:', recoveryBurnError);
+          // Continue with swap - the ARIO will be picked up next cycle
+        }
+      }
+    }
+
+    // Step 4: Calculate USDC needed for swap
+    logger.info('📊 Step 4: Calculating swap details...');
+    const swapCalc = await kyberSwap.calculateUsdcNeeded(remainingNeeded);
+
+    logger.info(`💱 Swap calculation:`);
+    logger.info(`├─ ARIO needed: ${remainingNeeded.toFixed(2)} ARIO`);
+    logger.info(`├─ USDC required: ${swapCalc.usdcNeeded.toFixed(2)} USDC`);
+    logger.info(`├─ Price: 1 ARIO = ${swapCalc.effectivePrice.toFixed(6)} USDC`);
+    logger.info(`└─ Price impact: ${swapCalc.priceImpact.toFixed(3)}%`);
+
+    // Check slippage
+    if (swapCalc.priceImpact > config.maxSlippage) {
+      logger.error(`❌ PRICE IMPACT TOO HIGH - ABORTING`);
+      logger.error(`├─ Current: ${swapCalc.priceImpact.toFixed(3)}%`);
+      logger.error(`└─ Maximum: ${config.maxSlippage}%`);
+
+      await sendMessageToSlack(
+        `⚠️ *ARIO Top-up Aborted - High Price Impact*\n\n` +
+        `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
+        `*Current Balance:* ${currentBalance.toLocaleString()} ARIO\n` +
+        `*Needs:* ${amountNeeded.toLocaleString()} ARIO\n\n` +
+        `*Price Impact Protection:*\n` +
+        `• Current impact: ${swapCalc.priceImpact.toFixed(3)}%\n` +
+        `• Maximum allowed: ${config.maxSlippage}%\n\n` +
+        `The bot will retry at the next scheduled interval.`
+      );
+      return;
+    }
+
+    // Check USDC balance
+    if (baseBalances.usdc.balanceFormatted < swapCalc.usdcNeeded) {
+      logger.error(`❌ INSUFFICIENT USDC`);
+      logger.error(`├─ Have: ${baseBalances.usdc.balanceFormatted.toFixed(2)} USDC`);
+      logger.error(`├─ Need: ${swapCalc.usdcNeeded.toFixed(2)} USDC`);
+      logger.error(`└─ Shortfall: ${(swapCalc.usdcNeeded - baseBalances.usdc.balanceFormatted).toFixed(2)} USDC`);
+
+      await sendMessageToSlack(
+        `⚠️ *Insufficient USDC Balance*\n\n` +
+        `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
+        `*Current Balance:* ${currentBalance.toLocaleString()} ARIO\n` +
+        `*Needs:* ${amountNeeded.toLocaleString()} ARIO\n\n` +
+        `*USDC Shortage:*\n` +
+        `• Have: ${baseBalances.usdc.balanceFormatted.toFixed(2)} USDC\n` +
+        `• Need: ${swapCalc.usdcNeeded.toFixed(2)} USDC\n` +
+        `• Shortfall: ${(swapCalc.usdcNeeded - baseBalances.usdc.balanceFormatted).toFixed(2)} USDC\n\n` +
+        `Please fund the Base wallet with USDC.`
+      );
+      return;
+    }
+
+    // Step 5: Execute swap on Base (USDC → ARIO)
+    logger.info('📊 Step 5: Executing swap on Base chain...');
+    const swapResult = await kyberSwap.executeSwap(
+      swapCalc.usdcNeeded,
+      config.maxSlippage,
+      config.dryRun
+    );
+
+    if (!swapResult.success) {
+      logger.error('❌ Swap failed or aborted:', swapResult.reason);
+      return;
+    }
+
+    // Log swap to CSV
+    if (!config.dryRun && csvLogger) {
+      await csvLogger.logBaseSwap({
+        fromToken: 'USDC',
+        fromAmount: swapCalc.usdcNeeded,
+        toToken: 'ARIO',
+        toAmount: swapResult.expectedAmountOut,
+        exchangeRate: swapCalc.effectivePrice,
+        priceImpact: swapResult.priceImpact,
+        baseWallet: baseBridge.getWalletAddress(),
+        txHash: swapResult.txHash,
+        gasUsed: swapResult.gasUsed,
+      });
+    }
+
+    if (config.dryRun) {
+      logger.info(`[DRY RUN] Would receive ~${swapResult.expectedAmountOut.toFixed(2)} ARIO from swap`);
+    }
+
+    // Step 6: Burn ARIO on Base to bridge to AO
+    logger.info('📊 Step 6: Burning ARIO on Base to bridge to AO...');
+
+    // Get updated ARIO balance on Base after swap
+    let postSwapArioBalance;
+    try {
+      postSwapArioBalance = config.dryRun
+        ? swapResult.expectedAmountOut
+        : (await baseBridge.getArioBalance()).balanceFormatted;
+    } catch (balanceError) {
+      logger.error('Failed to get ARIO balance after swap:', balanceError);
+      logger.error('⚠️ SWAP SUCCEEDED but balance check failed. ARIO may be on Base wallet.');
+      logger.error(`Check Base wallet: ${baseBridge.getWalletAddress()}`);
+      await sendMessageToSlack(
+        `⚠️ *Swap Succeeded But Balance Check Failed*\n\n` +
+        `The USDC→ARIO swap completed but we couldn't verify the balance.\n\n` +
+        `*Swap TX:* \`${swapResult.txHash}\`\n` +
+        `*Base Wallet:* \`${baseBridge.getWalletAddress()}\`\n\n` +
+        `Please check the Base wallet manually and retry the burn.`
+      );
+      return;
+    }
+
+    const burnAmount = Math.min(postSwapArioBalance, remainingNeeded);
+    // Burn directly to target wallet (Turbo wallet)
+    const aoDestination = config.targetWalletAddress;
+
+    logger.info(`🔥 Burning ${burnAmount.toFixed(2)} ARIO on Base`);
+    logger.info(`└─ Destination (Turbo wallet): ${aoDestination}`);
+
+    let burnResult;
+    try {
+      burnResult = await baseBridge.burnToAO(burnAmount, aoDestination, config.dryRun);
+    } catch (burnError) {
+      logger.error('Failed to burn ARIO on Base:', burnError);
+      logger.error('⚠️ SWAP SUCCEEDED but BURN FAILED. ARIO is on Base wallet.');
+      logger.error(`Base wallet: ${baseBridge.getWalletAddress()}`);
+      logger.error(`ARIO on Base: ~${postSwapArioBalance.toFixed(2)} ARIO`);
+      await sendMessageToSlack(
+        `⚠️ *CRITICAL: Swap Succeeded But Burn Failed*\n\n` +
+        `The USDC→ARIO swap completed but the burn to AO failed!\n\n` +
+        `*ARIO stuck on Base:* ~${postSwapArioBalance.toFixed(2)} ARIO\n` +
+        `*Swap TX:* \`${swapResult.txHash}\`\n` +
+        `*Base Wallet:* \`${baseBridge.getWalletAddress()}\`\n` +
+        `*Error:* ${burnError.message}\n\n` +
+        `The bot will attempt to burn on the next cycle (ARIO detected on Base).`
+      );
+      return;
+    }
+
+    // Log burn to CSV
+    if (!config.dryRun && csvLogger) {
+      await csvLogger.logBaseBurn({
+        token: 'ARIO',
+        amount: burnAmount,
+        baseWallet: baseBridge.getWalletAddress(),
+        aoDestination,
+        txHash: burnResult.txHash,
+        gasUsed: burnResult.gasUsed,
+      });
+    }
+
+    if (config.dryRun) {
+      logger.info(`[DRY RUN] Would burn ${burnAmount.toFixed(2)} ARIO to ${aoDestination}`);
+      logger.info(`[DRY RUN] ARIO would arrive on AO after bridge processing`);
+
+      // Send dry run notification
+      await sendSwapNotification({
+        amountNeeded,
+        usdcAmount: swapCalc.usdcNeeded,
+        expectedArio: swapResult.expectedAmountOut,
+        effectivePrice: swapCalc.effectivePrice,
+        priceImpact: swapResult.priceImpact,
+        swapRequired: true,
+        targetBalance: config.targetBalance,
+        targetWallet: config.targetWalletAddress,
+        previousArioBalance: currentBalance,
+        usdcBalance: baseBalances.usdc.balanceFormatted,
+        ethBalance: baseBalances.eth.balanceFormatted,
+        baseArioBalance: baseBalances.ario.balanceFormatted,
+        recoveryAmount: botAoBalance.balance,
+      }, true);
+
+      logger.info('═══════════════════════════════════════════════════════════════');
+      logger.info('                    [DRY RUN] SIMULATION COMPLETE              ');
+      logger.info('═══════════════════════════════════════════════════════════════');
+      return;
+    }
+
+    // Step 7: Verify bridge Credit-Notice on AO
+    logger.info('📊 Step 7: Verifying bridge Credit-Notice on AO...');
+    logger.info('⏳ Waiting for bridge to process...');
+
+    const bridgeVerifyResult = await waitForBridgeCredit(
+      config.targetWalletAddress,
+      burnAmount,
+      {
+        maxWaitMs: 30 * 60 * 1000, // Wait up to 30 minutes
+        pollIntervalMs: 60 * 1000, // Poll every 1 minute
+        onPoll: ({ attempt, elapsedMs }) => {
+          logger.info(`├─ Checking for Credit-Notice (attempt ${attempt}, ${Math.round(elapsedMs/1000)}s elapsed)...`);
+        }
+      }
+    );
+
+    if (bridgeVerifyResult.success) {
+      logger.info(`✅ Bridge verified! Credit-Notice received on AO`);
+      logger.info(`├─ TX: ${bridgeVerifyResult.transaction.id}`);
+      logger.info(`├─ Amount: ${bridgeVerifyResult.transaction.quantityArio.toFixed(2)} ARIO`);
+      logger.info(`└─ Wait time: ${Math.round(bridgeVerifyResult.waitTimeMs/1000)}s`);
+    } else {
+      logger.warn(`⚠️ Could not verify bridge Credit-Notice within timeout`);
+      logger.warn(`└─ The bridge may still be processing. Check manually.`);
+    }
+
+    // Get final balances for notification
+    const finalBaseBalances = await baseBridge.getAllBalances();
+
+    // Send appropriate notification based on bridge verification
+    if (bridgeVerifyResult.success) {
+      // Success - everything worked
+      await sendMessageToSlack(
+        `✅ *ARIO Top-up Complete*\n\n` +
+        `*Swap:* ${swapCalc.usdcNeeded.toFixed(2)} USDC → ${swapResult.expectedAmountOut.toFixed(2)} ARIO\n` +
+        `*Swap TX:* \`${swapResult.txHash}\`\n\n` +
+        `*Burn:* ${burnAmount.toFixed(2)} ARIO → Turbo wallet\n` +
+        `*Burn TX:* \`${burnResult.txHash}\`\n\n` +
+        `*Bridge Credit:* \`${bridgeVerifyResult.transaction.id}\`\n` +
+        `*Amount Received:* ${bridgeVerifyResult.transaction.quantityArio.toFixed(2)} ARIO ✅\n\n` +
+        `*Target Wallet:* \`${config.targetWalletAddress}\`\n` +
+        `*New Balance:* ~${(currentBalance + burnAmount).toLocaleString()} ARIO`
+      );
+    } else {
+      // Alert - swap and burn worked but bridge not verified
+      await sendMessageToSlack(
+        `⚠️ *ALERT: Swap & Burn Succeeded But Bridge Unverified*\n\n` +
+        `The swap and burn completed, but we could not verify the Credit-Notice on AO within 30 minutes.\n\n` +
+        `*Swap:* ${swapCalc.usdcNeeded.toFixed(2)} USDC → ${swapResult.expectedAmountOut.toFixed(2)} ARIO ✅\n` +
+        `*Swap TX:* \`${swapResult.txHash}\`\n\n` +
+        `*Burn:* ${burnAmount.toFixed(2)} ARIO ✅\n` +
+        `*Burn TX:* \`${burnResult.txHash}\`\n\n` +
+        `*Bridge:* ⚠️ UNVERIFIED\n` +
+        `*Destination:* \`${config.targetWalletAddress}\`\n\n` +
+        `⚠️ Please verify manually that the ARIO arrived on AO.`
+      );
+    }
+
+    logger.info('✅ Cross-chain top-up completed');
+    logger.info('├─ Swap: Complete');
+    logger.info('├─ Burn: Complete');
+    logger.info(`└─ Bridge: ${bridgeVerifyResult.success ? `Verified (TX: ${bridgeVerifyResult.transaction.id})` : 'UNVERIFIED - check manually'}`);
+    logger.info('═══════════════════════════════════════════════════════════════');
+
   } catch (error) {
     logger.error('❌ Top-up failed:', error);
+
+    await sendMessageToSlack(
+      `❌ *ARIO Top-up Failed*\n\n` +
+      `*Error:* ${error.message}\n\n` +
+      `Please check the logs for details.`
+    );
   }
 }
 
+/**
+ * Main entry point
+ */
 async function main() {
   try {
-    await loadWallet();
-    
+    logger.info('Starting ARIO Balance Maintainer (Cross-Chain Edition)');
+
+    // Validate configuration
+    if (!validateConfig(config, logger)) {
+      logger.error('Configuration validation failed');
+      process.exit(1);
+    }
+
+    // Initialize wallets and services
+    await initialize();
+
     // Run once on startup
     await performTopUp();
-    
+
     // Schedule regular checks
     cron.schedule(config.cronSchedule, async () => {
       logger.info('Running scheduled top-up check');
       await performTopUp();
     });
-    
-    logger.info(`Bot started. Will check balance on schedule: ${config.cronSchedule}`);
+
+    logger.info(`Bot started. Schedule: ${config.cronSchedule}`);
     logger.info(`Dry run mode: ${config.dryRun}`);
+
   } catch (error) {
     logger.error('Failed to start bot:', error);
     process.exit(1);

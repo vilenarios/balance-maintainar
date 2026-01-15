@@ -1,0 +1,12 @@
+{
+  "d": "your-wallet-private-key-data-here",
+  "dp": "...",
+  "dq": "...",
+  "e": "...",
+  "ext": true,
+  "kty": "RSA",
+  "n": "...",
+  "p": "...",
+  "q": "...",
+  "qi": "..."
+}

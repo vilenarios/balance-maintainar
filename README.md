@@ -1,31 +1,46 @@
-# ARIO Balance Maintainer Bot
+# Token Balance Maintainer Bot
 
-An automated bot that maintains ARIO token balance for a specified wallet by swapping wUSDC tokens on Permaswap DEX when the balance falls below a configured threshold.
+An automated bot that maintains token balance for a specified wallet by swapping tokens on Permaswap DEX when the balance falls below a configured threshold. By default, it maintains ARIO balance by swapping wUSDC, but it can be configured for any token pair available on Permaswap.
+
+🚀 **Coming Soon**: Support for Botega DEX integration! The bot architecture is designed to support multiple DEXes, and Botega support will be added in a future update.
+
+## ⚠️ Important Disclaimer
+
+This is an **ALPHA** product provided as-is for the community. By using this bot:
+
+- 🚧 You acknowledge this is experimental software in active development
+- 💸 You assume all risks associated with automated trading and token swaps
+- 🔧 You understand that support is community-driven with no guarantees
+- 📊 You are responsible for monitoring your bot and transactions
+- 🧪 You should thoroughly test with small amounts first
+
+**USE AT YOUR OWN RISK**. The maintainers are not responsible for any losses incurred through the use of this software.
 
 ## Features
 
 - 🔄 Automatic balance monitoring and top-up
-- 💱 Integration with Permaswap DEX for token swaps
+- 💱 Integration with Permaswap DEX for token swaps (Botega coming soon!)
 - 📊 Configurable balance thresholds
 - 🔔 Slack notifications for successful swaps
 - 🧪 Dry run mode for testing
 - ⏰ Cron-based scheduling
 - 📝 Comprehensive logging
 - 🆔 Transaction ID tracking
+- 📊 CSV export for tax accounting
 
 ## Prerequisites
 
 - Node.js v16 or higher
 - npm or yarn
-- An Arweave wallet with wUSDC balance
-- Access to ARIO and wUSDC tokens on AO
+- An Arweave wallet with source token balance
+- Access to your chosen tokens on AO
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/ario-balance-maintainer.git
-cd ario-balance-maintainer
+git clone https://github.com/yourusername/balance-maintainer.git
+cd balance-maintainer
 ```
 
 2. Install dependencies:
@@ -41,8 +56,9 @@ cp .env.example .env
 4. Configure your `.env` file with your settings:
    - `WALLET_PATH`: Path to your Arweave wallet JSON file
    - `TARGET_WALLET_ADDRESS`: The wallet address to maintain balance for
-   - `MIN_BALANCE`: Minimum ARIO balance threshold (triggers top-up)
-   - `TARGET_BALANCE`: Target ARIO balance to maintain
+   - `MIN_BALANCE`: Minimum token balance threshold (triggers top-up)
+   - `TARGET_BALANCE`: Target token balance to maintain
+   - Token configuration (see Token Pair Configuration section)
    - `SLACK_TOKEN` and `SLACK_CHANNEL`: Optional Slack integration
 
 ## Configuration
@@ -51,27 +67,62 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| **Wallet Configuration** | | |
 | `WALLET_PATH` | Path to Arweave wallet JSON | `./wallet.json` |
 | `TARGET_WALLET_ADDRESS` | Wallet to maintain balance for | Required |
-| `ARIO_PROCESS_ID` | ARIO token process ID | `qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE` |
-| `PERMASWAP_POOL_ID` | ARIO/wUSDC pool ID | `V7yzKBtzmY_MacDF-czrb1RY06xfidcGVrOjnhthMWM` |
-| `WUSDC_PROCESS_ID` | wUSDC token process ID | `7zH9dlMNoxprab9loshv3Y7WG45DOny_Vrq9KrXObdQ` |
-| `MIN_BALANCE` | Minimum ARIO balance | `400000` |
-| `TARGET_BALANCE` | Target ARIO balance | `400000` |
+| **Token Configuration** | | |
+| `TARGET_TOKEN_PROCESS_ID` | Target token process ID | `qNvAoz0TgcH7DMg8BCVn8jF32QH5L6T29VjHxhHqqGE` (ARIO) |
+| `TARGET_TOKEN_SYMBOL` | Target token symbol | `ARIO` |
+| `TARGET_TOKEN_DECIMALS` | Target token decimals | `6` |
+| `SOURCE_TOKEN_PROCESS_ID` | Source token process ID | `7zH9dlMNoxprab9loshv3Y7WG45DOny_Vrq9KrXObdQ` (wUSDC) |
+| `SOURCE_TOKEN_SYMBOL` | Source token symbol | `wUSDC` |
+| `SOURCE_TOKEN_DECIMALS` | Source token decimals | `6` |
+| **DEX Configuration** | | |
+| `PERMASWAP_POOL_ID` | Permaswap pool ID | `V7yzKBtzmY_MacDF-czrb1RY06xfidcGVrOjnhthMWM` |
+| **Balance & Trading** | | |
+| `MIN_BALANCE` | Minimum token balance | `400000` |
+| `TARGET_BALANCE` | Target token balance | `400000` |
 | `MAX_SLIPPAGE` | Maximum allowed slippage % | `20` |
-| `MIN_TRANSFER_AMOUNT` | Minimum ARIO to transfer | `500` |
+| `MIN_TRANSFER_AMOUNT` | Minimum transfer amount | `500` |
 | `CRON_SCHEDULE` | Cron schedule pattern | `0 */6 * * *` (every 6 hours) |
 | `DRY_RUN` | Enable dry run mode | `false` |
+| **Notifications** | | |
+| `SLACK_ENABLED` | Enable Slack notifications | Auto-detected from token |
 | `SLACK_TOKEN` | Slack bot token | Optional |
-| `SLACK_CHANNEL` | Slack channel name | Optional |
+| `SLACK_CHANNEL` | Slack channel name | `#balance-maintainar` |
+| **Legacy Variables** | *(for backwards compatibility)* | |
+| `ARIO_PROCESS_ID` | Same as TARGET_TOKEN_PROCESS_ID | |
+| `WUSDC_PROCESS_ID` | Same as SOURCE_TOKEN_PROCESS_ID | |
 
 ### Balance Configuration
 
-- Balances are specified in ARIO tokens (not mARIO)
-- Example: `400000` = 400,000 ARIO tokens
+- Balances are specified in target token units (not smallest units)
+- Example: `400000` = 400,000 tokens
 - The bot will trigger when balance < `MIN_BALANCE`
-- It will swap enough wUSDC to bring balance to `TARGET_BALANCE`
+- It will swap enough source tokens to bring balance to `TARGET_BALANCE`
 - If the amount needed is less than `MIN_TRANSFER_AMOUNT`, the bot will skip and wait
+
+### Token Pair Configuration
+
+The bot is now flexible to work with any token pair:
+
+1. **Default Configuration (ARIO/wUSDC)**:
+   - No changes needed - works out of the box
+   - Maintains ARIO balance by swapping wUSDC
+
+2. **Custom Token Pair**:
+   ```env
+   # Example: Maintain TRUNK balance by swapping AR-IO
+   TARGET_TOKEN_PROCESS_ID=your-target-token-process-id
+   TARGET_TOKEN_SYMBOL=TRUNK
+   TARGET_TOKEN_DECIMALS=3
+   
+   SOURCE_TOKEN_PROCESS_ID=your-source-token-process-id
+   SOURCE_TOKEN_SYMBOL=AR-IO
+   SOURCE_TOKEN_DECIMALS=6
+   
+   PERMASWAP_POOL_ID=your-pool-process-id
+   ```
 
 ### Slippage Protection
 
@@ -104,9 +155,16 @@ Test the bot without executing real transactions:
 DRY_RUN=true npm start
 ```
 
-### Slack Notifications
+### Notification Configuration
 
-When configured, the bot sends detailed notifications including:
+#### Slack Notifications
+
+Slack notifications can be enabled/disabled:
+- Set `SLACK_ENABLED=true` to explicitly enable
+- Set `SLACK_ENABLED=false` to explicitly disable
+- If not set, auto-detects based on `SLACK_TOKEN` presence
+
+When enabled, the bot sends detailed notifications including:
 - Previous and current balances
 - Swap details (amount, price, slippage)
 - Transaction IDs for tracking
@@ -158,6 +216,33 @@ The bot uses Winston for logging:
 - Console output with timestamps
 - File logging to `topup-bot.log`
 - Structured JSON format for easy parsing
+
+## Tax Accounting Export
+
+The bot automatically generates a `transactions.csv` file for crypto tax accounting purposes:
+
+### CSV Fields
+- **timestamp**: ISO 8601 format timestamp
+- **transaction_type**: SWAP, TRANSFER, or RECOVERY_TRANSFER
+- **from_token**: Source token symbol
+- **from_amount**: Amount of source token
+- **to_token**: Destination token symbol
+- **to_amount**: Amount received
+- **exchange_rate**: Price at time of swap
+- **slippage_percent**: Actual vs expected difference
+- **from_wallet**: Source wallet address
+- **to_wallet**: Destination wallet address
+- **tx_id**: Main transaction ID
+- **order_id**: Permaswap order ID (swaps only)
+- **settlement_id**: Settlement note ID (swaps only)
+- **notes**: Additional context
+
+### Usage
+- The CSV file is created automatically on first transaction
+- Each transaction is appended as a new row
+- File is excluded from git (in .gitignore)
+- Compatible with most crypto tax software
+- Includes all data needed for cost basis calculations
 
 ## Development
 
