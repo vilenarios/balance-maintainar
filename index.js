@@ -520,6 +520,11 @@ async function performTopUp() {
     // Step 6: Burn ARIO on Base to bridge to AO
     logger.info('📊 Step 6: Burning ARIO on Base to bridge to AO...');
 
+    // Wait a few seconds for RPC node to fully update nonce state after swap
+    // This prevents "replacement transaction underpriced" errors
+    logger.info('⏳ Waiting 5 seconds for network state to settle...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
     // Get updated ARIO balance on Base after swap
     let postSwapArioBalance;
     try {
