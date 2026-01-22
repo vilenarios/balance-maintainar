@@ -338,7 +338,8 @@ async function performTopUp() {
         `Base wallet ETH balance is low:\n` +
         `• Current: ${baseBalances.eth.balanceFormatted.toFixed(6)} ETH\n` +
         `• Minimum: ${config.base.minEthBalance} ETH\n\n` +
-        `Please fund the Base wallet to ensure transactions can complete.`
+        `Please fund the Base wallet with ETH for gas.\n` +
+        `*Base Wallet:* \`${baseBridge.getWalletAddress()}\``
       );
     }
 
@@ -480,7 +481,8 @@ async function performTopUp() {
         `• Have: ${baseBalances.usdc.balanceFormatted.toFixed(2)} USDC\n` +
         `• Need: ${swapCalc.usdcNeeded.toFixed(2)} USDC\n` +
         `• Shortfall: ${(swapCalc.usdcNeeded - baseBalances.usdc.balanceFormatted).toFixed(2)} USDC\n\n` +
-        `Please fund the Base wallet with USDC.`
+        `Please fund the Base wallet with USDC.\n` +
+        `*Base Wallet:* \`${baseBridge.getWalletAddress()}\``
       );
       return;
     }
